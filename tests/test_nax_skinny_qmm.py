@@ -94,3 +94,50 @@ def test_armed_quantized_linear_takes_the_skinny_route(monkeypatch):
         vq.set_verify_qmm_armed(False)
     assert calls == [34]
     assert mx.allclose(routed, stock, atol=2e-2, rtol=2e-2).item()
+
+
+@pytest.mark.parametrize("cores", [12, 20, 32, 40, 80])
+@pytest.mark.parametrize("rows", [9, 16, 24, 32, 40, 48])
+@pytest.mark.parametrize("N", [5120, 6144, 12288, 17408, 248320])
+def test_split_scaling_boundaries_across_chips_rows_and_widths(cores, rows, N):
+    """Deterministic split(N, rows, bits, cores) matrix across chip tiers."""
+    for bits in nsq.BITS:
+        s = nsq.split(N, rows, bits=bits, cores=cores)
+        assert s in (2, 4, 8)
+        if N >= 65536:
+            assert s == 4
+            continue
+        if cores >= 32:
+            # 32-core M5 Max, 40-core M5 Max, 80-core M5 Ultra stay on base budget.
+            budget = 16 * cores
+            expected = 2
+            while expected < 8 and (N // 32) * expected * 2 <= budget:
+                expected *= 2
+            assert s == expected, (cores, rows, N, bits, s, expected)
+        elif rows > 32:
+            # 12..20 core GPUs taper cleanly back to 2 at 40..48 rows (RF == 3).
+            assert s == 2, (cores, rows, N, bits, s)
+        else:
+            # 12..20 core GPUs get >= 4 across N=5120..17408 at 9..32 rows.
+            assert s >= 4, (cores, rows, N, bits, s)
+            if bits == 8 and rows <= 16:
+                assert s == 8, (cores, rows, N, bits, s)
+            if bits in (4, 5) and rows in (24, 32):
+                assert s == 4, (cores, rows, N, bits, s)
+
+
+def test_split_is_monotone_in_rows_and_non_increasing_in_N():
+    """Wider outputs or higher row fragments never jump to a larger split."""
+    for cores in (12, 20, 24, 32, 40, 80):
+        for bits in nsq.BITS:
+            for rows in (9, 16, 24, 32, 40, 48):
+                prev = 8
+                for N in (1024, 5120, 6144, 12288, 17408):
+                    cur = nsq.split(N, rows, bits=bits, cores=cores)
+                    assert cur <= prev
+                    prev = cur
+            for N in (5120, 6144, 12288, 17408):
+                s16 = nsq.split(N, 16, bits=bits, cores=cores)
+                s32 = nsq.split(N, 32, bits=bits, cores=cores)
+                s48 = nsq.split(N, 48, bits=bits, cores=cores)
+                assert s16 >= s32 >= s48
