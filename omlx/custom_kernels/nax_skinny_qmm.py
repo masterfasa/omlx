@@ -16,7 +16,9 @@ Two weight layouts:
 Inside a 64-wide group, K is permuted (identically for x and w) so a lane's 16 codes of a
 weight row are one contiguous ``2 * bits``-byte load. Dequantization matches stock MLX:
 fp32 ``scale * q + bias``, rounded once to the activation dtype; float32 accumulation.
-The K split depends only on the shape, so a row gets the same bits at every row count.
+The K split scales with GPU core count, row-fragment count (``ceil(M / 16)``) and
+bit-width, so a row gets the same bits across every row count sharing the same
+split.
 """
 
 from __future__ import annotations
@@ -216,8 +218,14 @@ BITS = (4, 5, 6, 8)
 MIN_ROWS = 9
 MAX_ROWS = 48
 
-# Simdgroups per GPU core the K split aims for (see ``split``).
+# Simdgroups per GPU core the K split aims for on 32+ core GPUs and at 33..48
+# rows (RF == 3), where register/barrier pressure dominates (see ``split``).
 _SIMDGROUPS_PER_CORE = 16
+# Below 32 cores (12-core M6, 20-core M5 Pro) and while register pressure is
+# low (RF <= 2, i.e. <= 32 rows), each threadgroup needs a deeper K split to
+# hide DRAM latency; budget ramps linearly from 32 cores down to 20 cores.
+_LOW_CORE_REF = 32
+_LOW_CORE_BUDGET = 2200
 _WIDE_N = 65536
 
 
@@ -249,16 +257,49 @@ def gpu_cores() -> int:
 
 
 @functools.cache
-def split(N: int) -> int:
-    """Simdgroups splitting K: the largest power of two up to 8 that keeps 32-column
-    threadgroups x split within the per-core budget. At least 2, since one is slower on
-    wide outputs, and at least 4 for vocabulary-size outputs, which exceed the budget.
-    """
-    budget = _SIMDGROUPS_PER_CORE * gpu_cores()
+def _split_for_cores(N: int, rf: int, bits: int, cores: int) -> int:
+    base = _SIMDGROUPS_PER_CORE * cores
+    max_s = 8
+    budget = base
+    if rf < 3 and cores < _LOW_CORE_REF:
+        core_factor = min(1.0, (_LOW_CORE_REF - cores) / 12.0)
+        bit_factor = 1.0 + max(0, bits - 4) * 0.25
+        if rf == 1:
+            boost = int(_LOW_CORE_BUDGET * core_factor * bit_factor)
+            budget = max(base, boost)
+        else:
+            boost = int(_LOW_CORE_BUDGET * core_factor * min(bit_factor, 1.5))
+            budget = max(base, boost)
+            if bits < 8 and base < boost:
+                s_base = 2
+                while s_base < 8 and (N // 32) * s_base * 2 <= base:
+                    s_base *= 2
+                max_s = max(4, s_base)
     s = 2
-    while s < 8 and (N // 32) * s * 2 <= budget:
+    while s < max_s and (N // 32) * s * 2 <= budget:
         s *= 2
     return max(s, 4) if N >= _WIDE_N else s
+
+
+def split(
+    N: int,
+    rows: int | None = None,
+    *,
+    bits: int = 4,
+    cores: int | None = None,
+) -> int:
+    """Simdgroups splitting K: a power of two in ``{2, 4, 8}``.
+
+    Uses ``_SIMDGROUPS_PER_CORE * cores`` on 32+ core GPUs and at 33..48 rows
+    (``RF == 3``). On lower-core GPUs (12..20 cores) at 9..32 rows (``RF <= 2``),
+    boosts the budget continuously with ``(32 - cores) / 12`` and bit-width so
+    5120..17408-column projections take split 4 (or 8 at 8-bit / narrow 1-fragment
+    shapes) and taper back to 2 at 33..48 rows. Vocabulary-size outputs
+    (``N >= 65536``) stay at least 4.
+    """
+    c = gpu_cores() if cores is None else int(cores)
+    rf = 3 if rows is None else max(1, -(-int(rows) // 16))
+    return _split_for_cores(int(N), rf, int(bits), c)
 
 
 def skinny_qmm(
@@ -275,7 +316,7 @@ def skinny_qmm(
 ) -> mx.array:
     """``x2`` (M, K) times affine group-64 weights (N, K) -> (M, N) in x2's dtype."""
     M = int(x2.shape[0])
-    s = split(N)
+    s = split(N, M, bits=bits)
     (y,) = _kernel()(
         inputs=[mx.contiguous(x2), w, scales, biases],
         template=[
