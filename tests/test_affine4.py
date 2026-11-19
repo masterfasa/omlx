@@ -684,3 +684,66 @@ def test_batch_left_padding_is_read_from_the_device_once_per_assignment(monkeypa
     mask = cache._attention_mask(None, 1, 16)
     assert len(reads) == 2
     assert mask[:, 0, 0, :].tolist() == [[False] * 3 + [True] * 13, [True] * 16]
+
+
+
+def _long_affine8_cache(keys, kv_heads=4, chunk=2048, seed=0):
+    mx.random.seed(seed)
+    cache = Affine8KVCache()
+    for start in range(0, keys, chunk):
+        n = min(chunk, keys - start)
+        cache.update_and_fetch(
+            mx.random.normal((1, kv_heads, n, 256)).astype(mx.bfloat16),
+            mx.random.normal((1, kv_heads, n, 256)).astype(mx.bfloat16),
+        )
+    mx.eval(cache.state)
+    return cache
+
+
+@pytest.mark.parametrize("split", [1, 4])
+@pytest.mark.parametrize("keys,rows", [(4096, 1024), (6144, 2048)])
+def test_tile_prefill_matches_the_dequantize_route(monkeypatch, keys, rows, split):
+    require_tensor_ops()
+    monkeypatch.setattr(affine4, "_TILE_MIN_KEYS", 1024)
+    monkeypatch.setattr(affine4, "_TILE_PREFILL_SPLIT", split)
+    monkeypatch.setattr(affine4, "_TILE_PREFILL_SPLIT_MIN_KEYS", 1024)
+    monkeypatch.setattr(affine4, "_TILE_LAUNCHABLE", {})
+    cache = _long_affine8_cache(keys)
+    ks, vs = cache.state
+    q = mx.random.normal((1, 24, rows, 256)).astype(mx.bfloat16)
+
+    def run(on):
+        monkeypatch.setattr(affine4, "_tile_attention_available", lambda: on)
+        out = cache.attention(
+            q, keys_state=ks, values_state=vs, scale=256**-0.5, mask="causal"
+        )
+        return out.astype(mx.float32)
+
+    ref, out = run(False), run(True)
+    assert list(affine4._TILE_LAUNCHABLE.values()) == [True]
+    diff = mx.abs(out - ref)
+    assert out.shape == ref.shape
+    assert mx.max(diff).item() < 0.02 * mx.max(mx.abs(ref)).item() + 1e-3
+    assert mx.mean(diff).item() < 2e-3
+
+
+def test_tile_launch_error_turns_the_signature_off(monkeypatch):
+    require_tensor_ops()
+    from omlx.utils import affine8_tile_attention as tile
+
+    monkeypatch.setattr(affine4, "_TILE_MIN_KEYS", 1024)
+    monkeypatch.setattr(affine4, "_TILE_LAUNCHABLE", {})
+    monkeypatch.setattr(affine4, "_tile_attention_available", lambda: True)
+    cache = _long_affine8_cache(2048)
+    ks, vs = cache.state
+    q = mx.random.normal((1, 24, 1024, 256)).astype(mx.bfloat16)
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("no MPP headers")
+
+    monkeypatch.setattr(tile, "prefill", fail)
+    out = cache.attention(
+        q, keys_state=ks, values_state=vs, scale=256**-0.5, mask="causal"
+    )
+    assert out.shape == (1, 24, 1024, 256)
+    assert list(affine4._TILE_LAUNCHABLE.values()) == [False]
