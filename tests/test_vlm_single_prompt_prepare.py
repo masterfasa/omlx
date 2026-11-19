@@ -367,3 +367,36 @@ def test_glm_ids_are_the_generation_ids(case):
     prepared = engine.prepare_chat_prompt(messages, tools, kwargs, partial)
 
     assert list(prepared[1]) == expected
+
+
+def test_prepared_vlm_prompt_uses_prefix_token_cache_for_long_text(monkeypatch):
+    """When #5302 and #5325 are stacked, text-only VLM prepare_chat_prompt reuses _prefix_tokens."""
+    from tokenizers import Tokenizer, decoders, models, pre_tokenizers, trainers
+    from omlx.utils import prefix_tokens as pt
+
+    tok_obj = Tokenizer(models.BPE())
+    tok_obj.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+    tok_obj.decoder = decoders.ByteLevel()
+    trainer = trainers.BpeTrainer(
+        vocab_size=500, initial_alphabet=pre_tokenizers.ByteLevel.alphabet()
+    )
+    tok_obj.train_from_iterator(["Hello world. " * 200, "Question about section 1.\n\n" * 100], trainer)
+    bpe_tok = PreTrainedTokenizerFast(tokenizer_object=tok_obj)
+    bpe_tok.chat_template = _TEMPLATE
+
+    monkeypatch.setattr(pt, "MIN_CHARS", 1_000)
+    monkeypatch.setattr(vlm_module, "PREFIX_TOKENS_MIN_CHARS", 1_000)
+    engine = _engine("qwen3_5", bpe_tok)
+    engine._prefix_tokens = pt.prefix_token_cache_for(engine._tokenizer)
+    assert engine._prefix_tokens is not None
+
+    doc = ("Hello world section detail. " * 150) + "\n\n"
+    m1 = [{"role": "user", "content": doc + "Question 1?"}]
+    m2 = [{"role": "user", "content": doc + "Question 2?"}]
+    p1 = engine.prepare_chat_prompt(m1)
+    p2 = engine.prepare_chat_prompt(m2)
+
+    assert isinstance(p1, _VLMPreparedPrompt) and isinstance(p2, _VLMPreparedPrompt)
+    assert engine._prefix_tokens.full == 1
+    assert engine._prefix_tokens.reused == 1
+    assert list(p2[1]) == list(bpe_tok.encode(p2[0], add_special_tokens=False))
