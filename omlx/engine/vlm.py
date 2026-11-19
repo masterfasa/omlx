@@ -6300,9 +6300,16 @@ class VLMBatchedEngine(BaseEngine):
                 is_partial=is_partial,
             )[0]
             if isinstance(prompt, str):
-                token_ids = list(
-                    self._tokenizer.encode(prompt, add_special_tokens=False)
-                )
+                prefix_tokens = getattr(self, "_prefix_tokens", None)
+                if (
+                    prefix_tokens is not None
+                    and len(prompt) >= PREFIX_TOKENS_MIN_CHARS
+                ):
+                    token_ids = prefix_tokens.encode(prompt)
+                else:
+                    token_ids = list(
+                        self._tokenizer.encode(prompt, add_special_tokens=False)
+                    )
                 return _VLMPreparedPrompt(
                     prompt,
                     token_ids,
