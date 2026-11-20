@@ -42,11 +42,13 @@ _CHECKED: dict[tuple, bool] = {}
 @functools.lru_cache(maxsize=1024)
 def _route(rows: int, K: int, N: int, bits: int, group_size: int, dtype):
     route = qwen35_verify_qmm._verify_route(rows, K, N, bits, group_size, dtype)
-    # Decode rows keep mma; the skinny kernel is measured on verify rows only.
-    if route == "skinny" and qwen35_verify_qmm.mma_eligible(
-        rows, K, N, bits, group_size, dtype
-    ):
-        return "mma"
+    # Decode rows keep sg8/mma; the skinny kernel is measured on verify rows only.
+    if route == "skinny":
+        if qwen35_verify_qmm.sg8_eligible(rows, K, N, bits, group_size, dtype):
+            return "sg8"
+        if qwen35_verify_qmm.mma_eligible(rows, K, N, bits, group_size, dtype):
+            return "mma"
+        return None
     return route if route in _ROUTES else None
 
 

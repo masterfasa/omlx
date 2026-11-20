@@ -65,3 +65,49 @@ def test_dispatch_keeps_small_and_wide_calls_off_the_skinny_kernel(monkeypatch):
     for M in (8, 9, 48, 49):
         mx.eval(packed(_rows(M, K, seed=M)))
     assert calls == [9, 48]
+
+
+def test_core_count_aware_small_geometry_and_matvec_ksplit():
+    # 80-core M5 Ultra keeps upstream _TARGET_TGS = 1400 behavior verbatim.
+    for M in (2, 4, 5, 6, 8):
+        assert pl._small_geometry(5120, 34816, M, cores=80) == (5, 1)
+        assert pl._small_geometry(5120, 10240, M, cores=80) == (10, 2)
+        assert pl._small_geometry(5120, 14336, M, cores=80) == (10, 2)
+
+    # 20-core M5 Pro keeps upstream splits at M=2..4, eliminates _reduce
+    # (ks=1, parts=2) on gdn_qkv/attn_qkv from M=5, and caps mlp_gate+up at
+    # (2, 1) from M=6.
+    for M in (2, 4):
+        assert pl._small_geometry(5120, 34816, M, cores=20) == (5, 1)
+        assert pl._small_geometry(5120, 10240, M, cores=20) == (10, 2)
+        assert pl._small_geometry(5120, 14336, M, cores=20) == (10, 2)
+    assert pl._small_geometry(5120, 34816, 5, cores=20) == (5, 1)
+    assert pl._small_geometry(5120, 10240, 5, cores=20) == (1, 2)
+    assert pl._small_geometry(5120, 14336, 5, cores=20) == (1, 2)
+    for M in (6, 8):
+        assert pl._small_geometry(5120, 34816, M, cores=20) == (2, 1)
+        assert pl._small_geometry(5120, 10240, M, cores=20) == (1, 2)
+        assert pl._small_geometry(5120, 14336, M, cores=20) == (1, 2)
+
+    # 12-core M6 and 32-core M5 Max stay bounded without over-splitting.
+    assert pl._small_geometry(5120, 34816, 6, cores=12) == (1, 1)
+    assert pl._small_geometry(5120, 10240, 6, cores=12) == (1, 2)
+    assert pl._small_geometry(5120, 10240, 6, cores=32) == (1, 2)
+    assert pl._small_geometry(5120, 34816, 6, cores=32) == (2, 1)
+
+
+@pytest.mark.parametrize("M", [1, 2, 4, 5, 6, 8])
+@pytest.mark.parametrize("K,N", [(1024, 1024), (2048, 2560)])
+def test_packed_small_and_matvec_match_reference(M, K, N):
+    layer = _linear(K, N, seed=M * 17 + N)
+    w, s, b = layer.weight, layer.scales, layer.biases
+    packed = pl._pack([layer])[0]
+    x = _rows(M, K, seed=M + 3)
+    truth = (
+        x.astype(mx.float32)
+        @ mx.dequantize(w, s, b, group_size=64, bits=4).astype(mx.float32).T
+    )
+    stock = mx.quantized_matmul(x, w, s, b, transpose=True, group_size=64, bits=4)
+    got = packed(x)
+    assert got.shape == (M, N) and got.dtype == mx.bfloat16
+    assert _max_rel(got, truth) <= 1.25 * _max_rel(stock, truth) + 1e-4

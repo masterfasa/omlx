@@ -357,25 +357,42 @@ def _kernels():
     return _KERNELS
 
 
-# Target threadgroup count for the small-row kernels. In a dependent layer
-# chain one kernel runs at a time, so the grid itself must fill the GPU.
+# Target threadgroup count on an 80-core M5 Ultra. In a dependent layer
+# chain one kernel runs at a time, so the grid itself must fill the GPU,
+# but over-splitting K on <=40-core GPUs (e.g. 20-core M5 Pro) wastes DRAM
+# bandwidth writing fp32 partials and launching a separate _reduce kernel once
+# M >= 4.
 _TARGET_TGS = 1400
+_SMALL_CORE_CAP = 40
 
 
-def _ksplit(tiles: int, units: int) -> int:
-    """Largest divisor of ``units`` (K steps) keeping tiles x ksplit near the target."""
+def _ksplit(tiles: int, units: int, target_tgs: int = _TARGET_TGS) -> int:
+    """Largest divisor of ``units`` (K steps) keeping tiles x ksplit near target."""
     best = 1
     for d in range(1, units + 1):
-        if units % d == 0 and tiles * d <= _TARGET_TGS:
+        if units % d == 0 and tiles * d <= target_tgs:
             best = d
     return best
 
 
-def _small_geometry(K: int, N: int) -> tuple[int, int]:
+def _small_geometry(
+    K: int, N: int, M: int = 5, *, cores: int | None = None
+) -> tuple[int, int]:
     """(K splits across threadgroups, partitions inside one) for 2..8 rows."""
     steps = K // 256
     tiles = N // TILE_N
-    ksplit = _ksplit(tiles, steps)
+    c = nax_skinny_qmm.gpu_cores() if cores is None else int(cores)
+    rows = int(M)
+    if c <= _SMALL_CORE_CAP and rows >= 5:
+        if tiles < 256 and steps % 2 == 0:
+            ksplit = 1
+        elif rows >= 6:
+            target = min(_TARGET_TGS, max(128, c * 28))
+            ksplit = min(2, _ksplit(tiles, steps, target))
+        else:
+            ksplit = _ksplit(tiles, steps)
+    else:
+        ksplit = _ksplit(tiles, steps)
     parts = 2 if tiles < 256 and (steps // ksplit) % 2 == 0 else 1
     return ksplit, parts
 
@@ -428,7 +445,7 @@ def packed_matmul(x2: mx.array, w, sc, bi, K: int, N: int) -> mx.array:
         return y
     if M == 1:
         return _matvec(x2, w, sc, bi, K, N)
-    ksplit, parts = _small_geometry(K, N)
+    ksplit, parts = _small_geometry(K, N, M)
     sg = TILE_N // 16
     (y,) = kernels["small"](
         inputs=[x2, w, sc, bi],

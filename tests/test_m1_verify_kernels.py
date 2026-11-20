@@ -82,10 +82,17 @@ def test_tensor_unit_single_projection_takes_sg8_from_six_rows(qmv_off, monkeypa
     monkeypatch.setattr(m1_verify_mma, "enabled", lambda: False)
     monkeypatch.setattr(qwen35_verify_qmm, "is_nax_available", lambda: True)
     route = qwen35_verify_qmm._verify_route
-    assert [route(r, 6144, 5120, 5, 64, mx.bfloat16) for r in (4, 5, 6)] == [
+    # 4-bit single projections keep stock below 6 rows and take sg8 at 6 rows;
+    # 5-bit projections take the NAX skinny kernel from 4 rows.
+    assert [route(r, 6144, 5120, 4, 64, mx.bfloat16) for r in (4, 5, 6)] == [
         None,
         None,
         "sg8",
+    ]
+    assert [route(r, 6144, 5120, 5, 64, mx.bfloat16) for r in (4, 5, 6)] == [
+        "skinny",
+        "skinny",
+        "skinny",
     ]
 
 
@@ -183,7 +190,9 @@ def test_window_and_route_order(mma_on):
 def test_disabled_when_the_gate_is_off(monkeypatch):
     monkeypatch.setattr(m1_verify_mma, "enabled", lambda: False)
     assert not m1_verify_mma.eligible(8, 2048, 4096, 4, 64, mx.float16)
-    assert qwen35_verify_qmm._verify_route(8, 5120, 17408, 5, 64, mx.float16) == "sg8"
+    expected = "skinny" if qwen35_verify_qmm.is_nax_available() else "sg8"
+    assert qwen35_verify_qmm._verify_route(8, 5120, 17408, 5, 64, mx.float16) == expected
+    assert qwen35_verify_qmm._verify_route(8, 5120, 17408, 4, 64, mx.float16) == "sg8"
 
 
 @pytest.mark.parametrize("bits", [5, 6, 8])

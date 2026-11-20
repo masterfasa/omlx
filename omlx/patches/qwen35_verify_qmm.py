@@ -1572,12 +1572,48 @@ def skinny_eligible(M: int, K: int, N: int, bits: int, group_size: int, dtype) -
     return int(M) > _NAX_MMA_MAX_ROWS or mma_eligible(M, K, N, bits, group_size, dtype)
 
 
+def _small_skinny_eligible(
+    M: int, K: int, N: int, bits: int, group_size: int, dtype
+) -> bool:
+    """NAX skinny kernel for 4..8-row 5-bit and 5..8-row 6-bit verify projections.
+
+    Non-power-of-two bit widths (5- and 6-bit) span 32-bit word boundaries and
+    pay heavy scalar bit-unpacking overhead per row in stock qmv and sg8. The
+    NAX skinny kernel dequantizes each 64-weight group once into tensor-unit
+    fragments and multiplies all M rows in one pass (RF=1), beating both stock
+    qmv (at M=4..5) and sg8 (at M=6..8) across 5-bit projections and 6-bit
+    projections including lm_head.
+    """
+    rows = int(M)
+    b = int(bits)
+    if b == 5:
+        if not (4 <= rows < nax_skinny_qmm.MIN_ROWS):
+            return False
+    elif b == 6:
+        if not (6 <= rows < nax_skinny_qmm.MIN_ROWS):
+            return False
+    else:
+        return False
+    import mlx.core as mx
+
+    return (
+        int(group_size) == 64
+        and dtype in (mx.bfloat16, mx.float16)
+        and int(K) % 64 == 0
+        and int(N) % 32 == 0
+        and int(N) >= _MIN_MMA_ROUTE_N
+        and is_nax_available()
+    )
+
+
 def _verify_route(rows: int, K: int, N: int, bits: int, group_size: int, dtype):
     """Kernel an armed verify projection runs ("m1", "m1_mma", "sg8", "skinny",
     "mma" or "vk"), or None for the stock qmm."""
     m1 = _m1_route(rows, K, N, bits, group_size, dtype)
     if m1:
         return m1
+    if _small_skinny_eligible(rows, K, N, bits, group_size, dtype):
+        return "skinny"
     if sg8_eligible(rows, K, N, bits, group_size, dtype):
         if rows < _SG8_SINGLE_MIN_ROWS_NAX and is_nax_available():
             return None
