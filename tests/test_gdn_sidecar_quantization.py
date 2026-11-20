@@ -1548,3 +1548,88 @@ def test_constructors_reject_unknown_dtype(tmp_path, bad):
             gdn_ssd_split_enabled=True,
             gdn_sidecar_state_dtype=bad,
         )
+
+
+def _multi_layer_rht_extracted(num_layers: int = 6) -> list[dict]:
+    layers = []
+    for i in range(num_layers):
+        conv = (mx.arange(24, dtype=mx.float32).reshape(1, 3, 8) + i).astype(mx.bfloat16)
+        base = mx.arange(1, 1 + 2 * 4 * 16, dtype=mx.float32).reshape(1, 2, 4, 16)
+        rec = (base - 64.5 + i * 3.0) * 0.125
+        layers.append(
+            {
+                "state": (conv, rec),
+                "meta_state": (),
+                "class_name": "ArraysCache",
+                "cache_type": "ArraysCache",
+            }
+        )
+    return layers
+
+
+@pytest.mark.parametrize("mode", ["fp32", "bf16", "int8", "rht_int8", "rht_int16"])
+def test_batched_serialize_uses_single_eval_and_matches_bytes(tmp_path, monkeypatch, mode):
+    """_serialize_extracted must materialize all tensors and checks in one mx.eval."""
+    store = BoundarySnapshotSSDStore(tmp_path / mode, gdn_sidecar_state_dtype=mode)
+    extracted = _multi_layer_rht_extracted(6)
+    mx.eval(*[t for entry in extracted for t in entry["state"]])
+    orig_eval = mx.eval
+    eval_calls = 0
+
+    def counted_eval(*args, **kwargs):
+        nonlocal eval_calls
+        eval_calls += 1
+        return orig_eval(*args, **kwargs)
+
+    try:
+        monkeypatch.setattr(mx, "eval", counted_eval)
+        tensors, metadata = store._serialize_extracted(extracted, "single-eval", 2048)
+        assert eval_calls == 1, f"expected 1 mx.eval in mode={mode}, got {eval_calls}"
+        monkeypatch.setattr(mx, "eval", orig_eval)
+
+        restored = store._deserialize(tensors, metadata)
+        assert restored is not None
+        assert len(restored) == 6
+        expected_deq = 0 if mode == "fp32" else 6
+        assert store.gdn_state_dequantizations == expected_deq
+        for i in range(6):
+            assert mx.array_equal(
+                restored[i]["state"][0].view(mx.uint16),
+                extracted[i]["state"][0].view(mx.uint16),
+            ).item()
+    finally:
+        store.shutdown()
+
+
+@pytest.mark.parametrize("mode", ["int8", "rht_int8", "rht_int16"])
+@pytest.mark.parametrize("bad_value", [0.0, float("nan"), -1.0])
+def test_batched_decode_scale_validation_fails_closed_without_bumping_dequant(
+    tmp_path, mode, bad_value
+):
+    """A single corrupt layer scale in a multi-layer sidecar must reject atomically."""
+    store = BoundarySnapshotSSDStore(tmp_path / mode, gdn_sidecar_state_dtype=mode)
+    extracted = _multi_layer_rht_extracted(4)
+    try:
+        tensors, metadata = store._serialize_extracted(extracted, "bad-scale", 2048)
+        # Corrupt layer 2's scale tensor in raw bytes
+        bad_tensors = dict(tensors)
+        raw, dtype_str, shape = bad_tensors["layer_2_state_1__scale"]
+        arr = np.frombuffer(raw, dtype=np.float32).copy()
+        arr[0] = bad_value
+        bad_tensors["layer_2_state_1__scale"] = (arr.tobytes(), dtype_str, shape)
+
+        with pytest.raises(ValueError, match="layer_2_state_1__scale"):
+            store._deserialize(bad_tensors, metadata)
+        assert store.gdn_state_dequantizations == 0
+        assert store.gdn_decode_failures == 1
+
+        # Also test the safetensors file path (load_file -> _reconstruct_from_safetensors)
+        from omlx.cache.boundary_snapshot_store import _write_safetensors_no_mx
+
+        fpath = tmp_path / mode / "corrupt.safetensors"
+        _write_safetensors_no_mx(fpath, bad_tensors, metadata)
+        assert store.load_file(fpath) is None
+        assert store.gdn_state_dequantizations == 0
+        assert store.gdn_decode_failures == 2
+    finally:
+        store.shutdown()

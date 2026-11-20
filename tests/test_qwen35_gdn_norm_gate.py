@@ -88,3 +88,66 @@ def test_probe_declines_unknown_served_arithmetic(monkeypatch):
         assert patch._sigmoid_exp() is None
     finally:
         patch._sigmoid_exp.cache_clear()
+
+
+@pytest.mark.parametrize("keep", [0, 2, 4])
+def test_commit_speculation_all_custom_fast_path_and_mixed_parity(keep):
+    """Fast path (all custom records) and mixed path must restore identical state & metadata."""
+    from mlx_vlm.models.cache import ArraysCache
+    from mlx_vlm.speculative.cache_state import start_speculative_cache
+
+    assert patch.apply_arrays_cache_replay_patch()
+    T = 4
+    prev = mx.arange(3 * 4, dtype=mx.float32).reshape(1, 3, 4)
+    rows = (mx.arange(T * 4, dtype=mx.float32) + 100).reshape(1, T, 4)
+    start_s = mx.zeros((1, 2, 2, 2), dtype=mx.float32)
+    mid_s = mx.ones((1, 2, 2, 2), dtype=mx.float32) * 2.0
+    final_s = mx.ones((1, 2, 2, 2), dtype=mx.float32) * 4.0
+
+    # All-custom transaction (window_pair + deferred)
+    c_fast = ArraysCache(size=2, left_padding=[2])
+    c_fast[0] = prev
+    c_fast[1] = start_s
+    tx_fast = start_speculative_cache([c_fast], T)
+    patch.record_window(c_fast, 0, prev, rows, 3)
+    patch.record_deferred_states(c_fast, 1, start_s, final_s, T, lambda _k: mid_s)
+    c_fast[0] = rows[:, -3:, :]
+    c_fast[1] = final_s
+    tx_fast.commit([keep])
+
+    assert c_fast._speculation is None
+    expected_conv = (
+        prev
+        if keep == 0
+        else (rows[:, keep - 3 : keep] if keep >= 3 else mx.concatenate([prev[:, keep:], rows[:, :keep]], axis=1))
+    )
+    expected_rec = start_s if keep == 0 else (final_s if keep == T else mid_s)
+    assert mx.array_equal(c_fast[0], expected_conv).item()
+    assert mx.array_equal(c_fast[1], expected_rec).item()
+    assert c_fast._left_padding_advance == keep
+
+    # Mixed transaction (custom slot 0 + stock states slot 1)
+    c_mix = ArraysCache(size=2, left_padding=[2])
+    c_mix[0] = prev
+    c_mix[1] = start_s
+    tx_mix = start_speculative_cache([c_mix], T)
+    patch.record_window(c_mix, 0, prev, rows, 3)
+    per_tok = [start_s + (i + 1) for i in range(T)]
+    c_mix.record_speculative_states(1, mx.stack(per_tok[:-1], axis=1), per_tok[-1])
+    c_mix[0] = rows[:, -3:, :]
+    c_mix[1] = per_tok[-1]
+    tx_mix.commit([keep])
+
+    assert c_mix._speculation is None
+    assert mx.array_equal(c_mix[0], expected_conv).item()
+    expected_mix_1 = start_s if keep == 0 else per_tok[keep - 1]
+    assert mx.array_equal(c_mix[1], expected_mix_1).item()
+    assert c_mix._left_padding_advance == keep
+
+
+def test_keep_array_caches_small_tuples():
+    a = patch._keep_array([3])
+    b = patch._keep_array([3])
+    assert a is b
+    assert a.dtype == mx.int32
+    assert a.tolist() == [3]
