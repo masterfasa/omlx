@@ -37,8 +37,19 @@ from . import qwen35_verify_qmm
 logger = logging.getLogger(__name__)
 
 _KERNELS: dict = {}
+_KEEP_ARRAYS: dict[tuple[int, ...], mx.array] = {}
 _PATCHED = False
 _NORM_CLASS: type | None = None
+
+
+def _keep_array(lengths) -> mx.array:
+    key = tuple(int(v) for v in lengths)
+    arr = _KEEP_ARRAYS.get(key)
+    if arr is None:
+        arr = mx.array(key, dtype=mx.int32)
+        if len(_KEEP_ARRAYS) < 64:
+            _KEEP_ARRAYS[key] = arr
+    return arr
 
 _HELPERS = """
 template <typename InT>
@@ -355,18 +366,21 @@ def fused_eligible(layer, q, cache, length) -> bool:
 def replay_state(layer, base, rows, keep):
     """State after the first ``keep[b]`` recorded rows of each batch row."""
     pk, pv, pa, pb = rows
-    geo = _geometry(layer, base.shape[0])
+    hk = layer.num_k_heads
+    hv = layer.num_v_heads
+    dk = layer.head_k_dim
+    dv = layer.head_v_dim
     (state,) = _kernel(False, True)(
         inputs=[base, layer.A_log, layer.dt_bias, pk, pv, pa, pb, keep],
         template=[
             ("InT", pk.dtype),
-            ("Hk", geo["Hk"]),
-            ("Hv", geo["Hv"]),
-            ("Dk", geo["Dk"]),
-            ("Dv", geo["Dv"]),
+            ("Hk", hk),
+            ("Hv", hv),
+            ("Dk", dk),
+            ("Dv", dv),
             ("P", pk.shape[1]),
         ],
-        grid=geo["grid"],
+        grid=(32, dv, base.shape[0] * hv),
         threadgroup=(32, 4, 1),
         output_shapes=[base.shape],
         output_dtypes=[mx.float32],
@@ -436,7 +450,7 @@ def verify_block(layer, cache, q, k, v, a, b, z):
 
 def record_block(cache, index, layer, start, rows, length):
     """Record a replayable block; the slot holds its lazy final state."""
-    full = mx.full((start.shape[0],), length, dtype=mx.int32)
+    full = _keep_array((length,) * start.shape[0])
     final = replay_state(layer, start, rows, full)
     record = ("replay", start, rows, int(length), layer, final)
     cache._speculation["records"][int(index)] = record
@@ -487,7 +501,7 @@ def _commit_replay(cache, index, record, lengths):
     if all(value == length for value in lengths):
         cache[index] = final
         return
-    keep = mx.array(lengths, dtype=mx.int32)
+    keep = _keep_array(lengths)
     state = replay_state(layer, start, rows, keep)
     cache[index] = state
     # Only the fused verify of the next block reads the pending replay.
@@ -562,7 +576,25 @@ def apply_arrays_cache_replay_patch() -> bool:
         if not custom:
             return orig_commit(self, lengths, generation)
         _, resolved = self.validate_speculation(lengths, generation)
-        # The stock commit then sees these slots as untouched.
+        if len(custom) == len(transaction["records"]):
+            # All recorded slots are handled by our custom committers; skip
+            # orig_commit to avoid a redundant validate_speculation pass and
+            # temporary record/state dict churn on every GDN layer.
+            for index, record in custom.items():
+                kind = record[0]
+                if kind == "replay":
+                    _commit_replay(self, index, record, resolved)
+                elif kind == "deferred":
+                    _commit_deferred(self, index, record, resolved)
+                else:
+                    _commit_window(self, index, record, resolved)
+            self._restore_speculative_metadata(
+                resolved,
+                transaction["initial_metadata"],
+            )
+            self._speculation = None
+            return
+        # Mixed transaction: hide custom slots from orig_commit, then apply them.
         for index in custom:
             del transaction["records"][index]
             self.cache[index] = transaction["initial_state"][index]

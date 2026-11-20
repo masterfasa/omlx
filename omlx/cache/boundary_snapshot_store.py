@@ -32,6 +32,7 @@ from typing import Any
 
 from .deepseek_v41_delta import compact_snapshot as compact_deepseek_v41_snapshot
 from .paged_ssd_cache import (
+    _MX_TO_ST_DTYPE,
     HAS_MLX,
     _encode_shape,
     _extract_tensor_bytes,
@@ -1327,18 +1328,30 @@ class BoundarySnapshotSSDStore:
 
             layer_info.append(info)
 
-        # Reject a corrupt recurrent state before materializing the payload it
-        # would have been written into.
-        self._verify_gdn_encode_checks(gdn_checks)
-
-        # Materialize lazy tensors on inference thread.
-        if arrays:
-            mx.eval(*arrays.values())
-
-        # Extract raw bytes (Metal-safe memoryview copy).
-        tensors_raw = {}
+        # Prepare bfloat16 -> uint16 views ahead of the single batched eval so
+        # we never trigger per-tensor GPU->CPU syncs during byte extraction,
+        # and fuse deferred GDN encode validity flags into that same eval.
+        views: dict[str, tuple[Any, str, list[int]]] = {}
+        eval_list: list[Any] = []
         for name, arr in arrays.items():
-            tensors_raw[name] = _extract_tensor_bytes(arr)
+            dtype_str = _MX_TO_ST_DTYPE[arr.dtype]
+            shape = list(arr.shape)
+            buf = arr.view(mx.uint16) if arr.dtype == mx.bfloat16 else arr
+            views[name] = (buf, dtype_str, shape)
+            eval_list.append(buf)
+
+        if gdn_checks:
+            flags = mx.stack([flag for _reason, _shape, flag in gdn_checks])
+            mx.eval(flags, *eval_list)
+            self._verify_gdn_encode_checks(gdn_checks, evaluated_flags=flags)
+        elif eval_list:
+            mx.eval(*eval_list)
+
+        # Extract raw bytes (Metal-safe memoryview copy; arrays already evaluated).
+        tensors_raw = {
+            name: (bytes(memoryview(buf)), dtype_str, shape)
+            for name, (buf, dtype_str, shape) in views.items()
+        }
 
         metadata = {
             "request_id": request_id,
@@ -1475,17 +1488,23 @@ class BoundarySnapshotSSDStore:
         return quantized, scale.astype(mx.float32), codec
 
     def _verify_gdn_encode_checks(
-        self, checks: list[tuple[str, tuple[int, ...], Any]]
+        self,
+        checks: list[tuple[str, tuple[int, ...], Any]],
+        *,
+        evaluated_flags: Any = None,
     ) -> None:
         """Evaluate every deferred encode check with a single sync."""
         if not checks:
             return
-        flags = mx.stack([flag for _reason, _shape, flag in checks])
-        mx.eval(flags)
-        if bool(mx.all(flags)):
+        if evaluated_flags is None:
+            flags = mx.stack([flag for _reason, _shape, flag in checks])
+        else:
+            flags = evaluated_flags
+        results = flags.tolist()
+        if all(results):
             return
         reason, shape, _flag = next(
-            check for check, ok in zip(checks, flags.tolist()) if not ok
+            check for check, ok in zip(checks, results) if not ok
         )
         with self._gdn_dequant_lock:
             self._gdn_encode_failures += 1
@@ -1613,6 +1632,8 @@ class BoundarySnapshotSSDStore:
         layer_idx: int,
         state_idx: int,
         tensor: Any,
+        scale_checks: list[tuple[str, str, str, Any]] | None = None,
+        dequant_counter: list[int] | None = None,
     ) -> Any:
         codec = info.get(f"state_{state_idx}_storage_codec")
         if not codec:
@@ -1625,7 +1646,10 @@ class BoundarySnapshotSSDStore:
                 raise ValueError(f"unsupported GDN storage codec: {codec}")
             self._validate_gdn_codec_metadata(info, state_idx, codec)
             if codec == _GDN_BF16_CODEC:
-                self._note_gdn_dequantization()
+                if dequant_counter is not None:
+                    dequant_counter[0] += 1
+                else:
+                    self._note_gdn_dequantization()
                 return tensor.astype(mx.float32)
             if codec in _GDN_INTEGER_CODECS:
                 scale_key = f"layer_{layer_idx}_state_{state_idx}__scale"
@@ -1641,13 +1665,21 @@ class BoundarySnapshotSSDStore:
                     mx.int16 if codec in _GDN_INT16_CODECS else mx.int8
                 )
                 self._validate_gdn_scale(
-                    tensor, scale, scale_key, payload_dtype=payload_dtype
+                    tensor,
+                    scale,
+                    scale_key,
+                    payload_dtype=payload_dtype,
+                    codec=codec,
+                    checks=scale_checks,
                 )
                 restored = tensor.astype(mx.float32) * scale
                 if codec in {_GDN_RHT_INT8_CODEC, _GDN_RHT_INT16_CODEC}:
                     seed, _dim = self._gdn_rht_metadata(info, state_idx, tensor)
                     restored = self._gdn_rht_inverse(restored, seed)
-                self._note_gdn_dequantization()
+                if dequant_counter is not None:
+                    dequant_counter[0] += 1
+                else:
+                    self._note_gdn_dequantization()
                 return restored
             raise ValueError(f"unsupported GDN storage codec: {codec}")
 
@@ -1658,6 +1690,8 @@ class BoundarySnapshotSSDStore:
         layer_idx: int,
         state_idx: int,
         tensor: Any,
+        scale_checks: list[tuple[str, str, str, Any]] | None = None,
+        dequant_counter: list[int] | None = None,
     ) -> Any:
         codec = info.get(f"state_{state_idx}_storage_codec")
         if not codec:
@@ -1670,7 +1704,10 @@ class BoundarySnapshotSSDStore:
                 raise ValueError(f"unsupported GDN storage codec: {codec}")
             self._validate_gdn_codec_metadata(info, state_idx, codec)
             if codec == _GDN_BF16_CODEC:
-                self._note_gdn_dequantization()
+                if dequant_counter is not None:
+                    dequant_counter[0] += 1
+                else:
+                    self._note_gdn_dequantization()
                 return tensor.astype(mx.float32)
             if codec in _GDN_INTEGER_CODECS:
                 scale_key = f"layer_{layer_idx}_state_{state_idx}__scale"
@@ -1684,13 +1721,21 @@ class BoundarySnapshotSSDStore:
                     mx.int16 if codec in _GDN_INT16_CODECS else mx.int8
                 )
                 self._validate_gdn_scale(
-                    tensor, scale, scale_key, payload_dtype=payload_dtype
+                    tensor,
+                    scale,
+                    scale_key,
+                    payload_dtype=payload_dtype,
+                    codec=codec,
+                    checks=scale_checks,
                 )
                 restored = tensor.astype(mx.float32) * scale
                 if codec in {_GDN_RHT_INT8_CODEC, _GDN_RHT_INT16_CODEC}:
                     seed, _dim = self._gdn_rht_metadata(info, state_idx, tensor)
                     restored = self._gdn_rht_inverse(restored, seed)
-                self._note_gdn_dequantization()
+                if dequant_counter is not None:
+                    dequant_counter[0] += 1
+                else:
+                    self._note_gdn_dequantization()
                 return restored
             raise ValueError(f"unsupported GDN storage codec: {codec}")
 
@@ -1701,6 +1746,8 @@ class BoundarySnapshotSSDStore:
         scale_key: str,
         *,
         payload_dtype: Any = None,
+        codec: str = "",
+        checks: list[tuple[str, str, str, Any]] | None = None,
     ) -> None:
         if payload_dtype is None:
             payload_dtype = mx.int8
@@ -1721,8 +1768,32 @@ class BoundarySnapshotSSDStore:
                 f"invalid GDN {kind} scale dtype for {scale_key}: "
                 f"expected float32, got {getattr(scale, 'dtype', None)}"
             )
-        if not bool(mx.all(mx.isfinite(scale) & (scale > 0))):
+        ok_flag = mx.all(mx.isfinite(scale) & (scale > 0))
+        if checks is not None:
+            checks.append((codec, kind, scale_key, ok_flag))
+        elif not bool(ok_flag):
             raise ValueError(f"invalid GDN {kind} scale values for {scale_key}")
+
+    def _verify_gdn_decode_scale_checks(
+        self,
+        checks: list[tuple[str, str, str, Any]],
+        dequant_count: int,
+    ) -> None:
+        """Evaluate every deferred GDN decode scale check in a single sync."""
+        if checks:
+            flags = mx.stack([flag for _codec, _kind, _key, flag in checks])
+            results = flags.tolist()
+            if not all(results):
+                codec, kind, scale_key, _flag = next(
+                    check for check, ok in zip(checks, results) if not ok
+                )
+                with self._gdn_decode_guard(codec):
+                    raise ValueError(
+                        f"invalid GDN {kind} scale values for {scale_key}"
+                    )
+        if dequant_count > 0:
+            with self._gdn_dequant_lock:
+                self._gdn_state_dequantizations += dequant_count
 
     def _deserialize(
         self,
@@ -1739,6 +1810,8 @@ class BoundarySnapshotSSDStore:
             return None
 
         result: list[dict[str, Any]] = []
+        scale_checks: list[tuple[str, str, str, Any]] = []
+        dequant_counter = [0]
         for i in range(num_layers):
             info = layer_info[i] if i < len(layer_info) else {}
             class_name = info.get("class_name", "KVCache")
@@ -1753,7 +1826,13 @@ class BoundarySnapshotSSDStore:
                 # V3 path: state_count meta + layer_{i}_state_{k} keys.
                 # V2 fallback: legacy layer_{i}_0/1 + zero_dim_0/1 keys
                 # for snapshots written before the N-tuple migration.
-                state = self._read_state_tuple_raw(tensors_raw, info, i)
+                state = self._read_state_tuple_raw(
+                    tensors_raw,
+                    info,
+                    i,
+                    scale_checks=scale_checks,
+                    dequant_counter=dequant_counter,
+                )
                 result.append(
                     {
                         "state": state,
@@ -1781,6 +1860,7 @@ class BoundarySnapshotSSDStore:
                 except (TypeError, json.JSONDecodeError):
                     return None
 
+        self._verify_gdn_decode_scale_checks(scale_checks, dequant_counter[0])
         return result
 
     def _read_state_tuple_raw(
@@ -1788,6 +1868,9 @@ class BoundarySnapshotSSDStore:
         tensors_raw: dict[str, tuple[bytes, str, list[int]]],
         info: dict[str, str],
         layer_idx: int,
+        *,
+        scale_checks: list[tuple[str, str, str, Any]] | None = None,
+        dequant_counter: list[int] | None = None,
     ) -> Any:
         """Read state for one layer from raw tensor bytes.
 
@@ -1863,6 +1946,8 @@ class BoundarySnapshotSSDStore:
                             layer_idx,
                             k,
                             restored,
+                            scale_checks=scale_checks,
+                            dequant_counter=dequant_counter,
                         )
                     )
             return tuple(elements)
@@ -1905,6 +1990,8 @@ class BoundarySnapshotSSDStore:
             return None
 
         result: list[dict[str, Any]] = []
+        scale_checks: list[tuple[str, str, str, Any]] = []
+        dequant_counter = [0]
         for i in range(num_layers):
             info = layer_info[i] if i < len(layer_info) else {}
             class_name = info.get("class_name", "KVCache")
@@ -1916,7 +2003,13 @@ class BoundarySnapshotSSDStore:
                 meta_state = ()
 
             if info.get("has_state") == "true":
-                state = self._read_state_tuple_arrays(arrays, info, i)
+                state = self._read_state_tuple_arrays(
+                    arrays,
+                    info,
+                    i,
+                    scale_checks=scale_checks,
+                    dequant_counter=dequant_counter,
+                )
                 result.append(
                     {
                         "state": state,
@@ -1943,6 +2036,7 @@ class BoundarySnapshotSSDStore:
                 except (TypeError, json.JSONDecodeError):
                     return None
 
+        self._verify_gdn_decode_scale_checks(scale_checks, dequant_counter[0])
         return result
 
     def _read_state_tuple_arrays(
@@ -1950,6 +2044,9 @@ class BoundarySnapshotSSDStore:
         arrays: dict[str, Any],
         info: dict[str, str],
         layer_idx: int,
+        *,
+        scale_checks: list[tuple[str, str, str, Any]] | None = None,
+        dequant_counter: list[int] | None = None,
     ) -> Any:
         """N-tuple aware safetensors-loaded variant of
         ``_read_state_tuple_raw`` — sources tensors from a pre-decoded
@@ -2015,6 +2112,8 @@ class BoundarySnapshotSSDStore:
                             layer_idx,
                             k,
                             tensor,
+                            scale_checks=scale_checks,
+                            dequant_counter=dequant_counter,
                         )
                     )
             return tuple(elements)
