@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 #
-# The recurrence keeps the thread layout of mlx-vlm's gated_delta kernel
-# (MIT, https://github.com/Blaizzy/mlx-vlm).
+# The recurrence keeps the 4-lanes-per-row packed butterfly layout of mlx-lm's
+# gated_delta_step_packed_btree kernel (MIT, https://github.com/ml-explore/mlx-lm).
 """Fused Qwen3.5 GDN verify recurrence with deferred state commit.
 
 The stock speculative verify runs, per GDN layer, the gate/beta ops, a
@@ -10,17 +10,21 @@ the gated RMSNorm and its SiLU gate. On the 27B the stored states alone are
 about 1 GB per verify.
 
 This module runs the gates, both state passes and the recurrence in one
-launch per layer, then the gated norm in a second one, and stores no
-per-position state. The cache records the block's k/v/a/b rows instead. A commit keeps
-``m`` positions by assigning a lazy replay of those rows to the state slot.
+launch per layer using the 4-lanes-per-row packed layout (8 value rows per
+simdgroup, 32 state elements per lane, ascending butterfly reduction), then
+the gated norm in a second one, and stores no per-position state. The cache
+records the block's k/v/a/b rows instead. A commit keeps ``m`` positions by
+assigning a lazy replay of those rows to the state slot.
 The next verify launch detects that pending replay and applies it in
 registers before its own block, so the replay costs no extra launch or state
 read. Any other reader of the slot evaluates the lazy replay normally.
 
-The arithmetic follows the stock chain: the per-row reduction order of
-``gated_delta_update``, the bf16 or fp16 rounding points of ``compute_g`` and
-``sigmoid``, MLX ``rms_norm`` and ``_precise_swiglu``. The decay helpers use
-precise transcendentals, and the SiLU gate follows the installed MLX build. The result is bit-exact on M3 and
+The arithmetic follows the stock chain: the per-row ascending-butterfly
+reduction order of ``gated_delta_step_packed_btree`` / ``gated_delta_update``,
+the bf16 or fp16 rounding points of ``compute_g`` (with ``A_log`` in either
+``q.dtype`` or ``float32``) and ``sigmoid``, MLX ``rms_norm`` and
+``_precise_swiglu``. The decay helpers use precise transcendentals, and the
+SiLU gate follows the installed MLX build. The result is bit-exact on M3 and
 later GPUs. On M1/M2 MLX's own softplus rounds very small values differently,
 so the decay of such rows can differ by one ulp.
 """
@@ -124,17 +128,25 @@ inline float gdn_decay(half a, half dt, float neg_a) {
 """
 
 _PROLOGUE = """
-    constexpr int NK = Dk / 32;
-    uint lane = thread_position_in_threadgroup.x;
+    constexpr int lanes_per_row = 4;
+    constexpr int rows_per_simdgroup = 32 / lanes_per_row;
+    constexpr int values_per_lane = Dk / lanes_per_row;
+    constexpr int partials_per_lane = values_per_lane / 4;
+
+    uint lane = thread_index_in_simdgroup;
+    uint row_in_simdgroup = lane / lanes_per_row;
+    uint lane_in_row = lane & (lanes_per_row - 1);
+    uint dv = thread_position_in_grid.y * rows_per_simdgroup + row_in_simdgroup;
+
     uint n = thread_position_in_grid.z;
     uint b_idx = n / Hv;
     uint hv = n % Hv;
     uint hk = hv / (Hv / Hk);
-    uint dv = thread_position_in_grid.y;
-    float st[NK];
+
+    float st[values_per_lane];
     {
-        auto s = state_in + (n * Dv + dv) * Dk + lane * NK;
-        for (int i = 0; i < NK; ++i)
+        auto s = state_in + (n * Dv + dv) * Dk + lane_in_row * values_per_lane;
+        for (int i = 0; i < values_per_lane; ++i)
             st[i] = static_cast<float>(s[i]);
     }
     float neg_a = -metal::precise::exp(static_cast<float>(A_log[hv]));
@@ -150,22 +162,34 @@ _REPLAY = """
             lane_g = gdn_decay(pa[gi], dtb, neg_a);
             lane_b = gdn_beta(pb[gi]);
         }
+        auto pk_ = pk + (b_idx * P * Hk + hk) * Dk + lane_in_row * values_per_lane;
+        auto pv_ = pv + (b_idx * P * Hv + hv) * Dv;
         for (int t = 0; t < keep; ++t) {
             float gt = simd_shuffle(lane_g, ushort(t));
             float bt = simd_shuffle(lane_b, ushort(t));
-            auto kp = pk + ((b_idx * P + t) * Hk + hk) * Dk + lane * NK;
-            float kv = 0.0f;
-            for (int i = 0; i < NK; ++i) {
-                st[i] = st[i] * gt;
-                kv += st[i] * kp[i];
+            float part[partials_per_lane];
+            for (int p = 0; p < partials_per_lane; ++p) {
+                float acc = 0.0f;
+                for (int i = 0; i < 4; ++i) {
+                    int e = p * 4 + i;
+                    st[e] = st[e] * gt;
+                    acc += st[e] * static_cast<float>(pk_[e]);
+                }
+                part[p] = acc;
             }
-            kv = simd_sum(kv);
-            float delta = (pv[((b_idx * P + t) * Hv + hv) * Dv + dv] - kv) * bt;
-            for (int i = 0; i < NK; ++i)
-                st[i] = st[i] + kp[i] * delta;
+            float kv =
+                ((part[0] + part[1]) + (part[2] + part[3])) +
+                ((part[4] + part[5]) + (part[6] + part[7]));
+            kv += simd_shuffle_xor(kv, ushort(1));
+            kv += simd_shuffle_xor(kv, ushort(2));
+            float delta = (static_cast<float>(pv_[dv]) - kv) * bt;
+            for (int e = 0; e < values_per_lane; ++e)
+                st[e] = st[e] + static_cast<float>(pk_[e]) * delta;
+            pk_ += Hk * Dk;
+            pv_ += Hv * Dv;
         }
-        auto o = state_out + (n * Dv + dv) * Dk + lane * NK;
-        for (int i = 0; i < NK; ++i)
+        auto o = state_out + (n * Dv + dv) * Dk + lane_in_row * values_per_lane;
+        for (int i = 0; i < values_per_lane; ++i)
             o[i] = st[i];
     }
 """
@@ -177,26 +201,49 @@ _MAIN = """
         lane_g = gdn_decay(a[gi], dtb, neg_a);
         lane_b = gdn_beta(b[gi]);
     }
+    auto q_ = q + (b_idx * T * Hk + hk) * Dk + lane_in_row * values_per_lane;
+    auto k_ = k + (b_idx * T * Hk + hk) * Dk + lane_in_row * values_per_lane;
+    auto v_ = v + (b_idx * T * Hv + hv) * Dv;
+    auto y_ = y + (b_idx * T * Hv + hv) * Dv;
     for (int t = 0; t < T; ++t) {
         float gt = simd_shuffle(lane_g, ushort(t));
         float bt = simd_shuffle(lane_b, ushort(t));
-        auto kp = k + ((b_idx * T + t) * Hk + hk) * Dk + lane * NK;
-        auto qp = q + ((b_idx * T + t) * Hk + hk) * Dk + lane * NK;
-        float kv = 0.0f;
-        for (int i = 0; i < NK; ++i) {
-            st[i] = st[i] * gt;
-            kv += st[i] * kp[i];
+        float part[partials_per_lane];
+        for (int p = 0; p < partials_per_lane; ++p) {
+            float acc = 0.0f;
+            for (int i = 0; i < 4; ++i) {
+                int e = p * 4 + i;
+                st[e] = st[e] * gt;
+                acc += st[e] * static_cast<float>(k_[e]);
+            }
+            part[p] = acc;
         }
-        kv = simd_sum(kv);
-        float delta = (v[((b_idx * T + t) * Hv + hv) * Dv + dv] - kv) * bt;
-        float acc = 0.0f;
-        for (int i = 0; i < NK; ++i) {
-            st[i] = st[i] + kp[i] * delta;
-            acc += st[i] * qp[i];
+        float kv =
+            ((part[0] + part[1]) + (part[2] + part[3])) +
+            ((part[4] + part[5]) + (part[6] + part[7]));
+        kv += simd_shuffle_xor(kv, ushort(1));
+        kv += simd_shuffle_xor(kv, ushort(2));
+        float delta = (static_cast<float>(v_[dv]) - kv) * bt;
+        for (int p = 0; p < partials_per_lane; ++p) {
+            float acc = 0.0f;
+            for (int i = 0; i < 4; ++i) {
+                int e = p * 4 + i;
+                st[e] = st[e] + static_cast<float>(k_[e]) * delta;
+                acc += st[e] * static_cast<float>(q_[e]);
+            }
+            part[p] = acc;
         }
-        acc = simd_sum(acc);
-        if (lane == 0)
-            y[((b_idx * T + t) * Hv + hv) * Dv + dv] = static_cast<InT>(acc);
+        float acc =
+            ((part[0] + part[1]) + (part[2] + part[3])) +
+            ((part[4] + part[5]) + (part[6] + part[7]));
+        acc += simd_shuffle_xor(acc, ushort(1));
+        acc += simd_shuffle_xor(acc, ushort(2));
+        if (lane_in_row == 0)
+            y_[dv] = static_cast<InT>(acc);
+        q_ += Hk * Dk;
+        k_ += Hk * Dk;
+        v_ += Hv * Dv;
+        y_ += Hv * Dv;
     }
 """
 
@@ -328,7 +375,8 @@ def _geometry(layer, batch):
         Hv=layer.num_v_heads,
         Dk=layer.head_k_dim,
         Dv=layer.head_v_dim,
-        grid=(32, layer.head_v_dim, batch * layer.num_v_heads),
+        grid=(32, layer.head_v_dim // 8, batch * layer.num_v_heads),
+        threadgroup=(32, 2, 1),
     )
 
 
@@ -345,7 +393,7 @@ def replay_eligible(layer, q, cache, length) -> bool:
         and layer.head_k_dim == 128
         and layer.head_v_dim == 128
         and layer.num_v_heads % layer.num_k_heads == 0
-        and layer.A_log.dtype == q.dtype
+        and layer.A_log.dtype in (q.dtype, mx.float32)
         and layer.dt_bias.dtype == q.dtype
         and (state is None or state.dtype == mx.float32)
         and (state is None or state.shape[0] == q.shape[0])
@@ -380,8 +428,8 @@ def replay_state(layer, base, rows, keep):
             ("Dv", dv),
             ("P", pk.shape[1]),
         ],
-        grid=(32, dv, base.shape[0] * hv),
-        threadgroup=(32, 4, 1),
+        grid=(32, dv // 8, base.shape[0] * hv),
+        threadgroup=(32, 2, 1),
         output_shapes=[base.shape],
         output_dtypes=[mx.float32],
     )
@@ -427,7 +475,7 @@ def verify_block(layer, cache, q, k, v, a, b, z):
         inputs=inputs,
         template=template,
         grid=geo["grid"],
-        threadgroup=(32, 4, 1),
+        threadgroup=geo["threadgroup"],
         output_shapes=output_shapes,
         output_dtypes=output_dtypes,
     )

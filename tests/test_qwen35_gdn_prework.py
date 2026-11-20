@@ -1047,6 +1047,7 @@ def test_fused_verify_replays_committed_rows_in_the_next_block(
     mx.random.seed(71)
     module = q35.Qwen3_5GatedDeltaNet(args)
     module.set_dtype(dtype)
+    module.A_log = module.A_log.astype(mx.float32)
     module.eval()
     blocks = [mx.random.normal((batch, seq, 64)).astype(dtype) for _ in range(2)]
     cache = ArraysCache(size=2)
@@ -1694,3 +1695,55 @@ def test_qwen4_fused_verify_multi_row_blocks_need_row_exact_arming(qwen4_verify)
         )
         transaction.abort()
     assert qwen4_verify == [1]
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+def test_4lane_fused_verify_fp32_a_log_27b_geometry(dtype):
+    """4-lane verify_block matches stock packed_btree + norm with real-checkpoint fp32 A_log on 27B head ratio (Hk=16, Hv=48)."""
+    from mlx_vlm.models.cache import ArraysCache
+    from mlx_vlm.models.qwen3_5 import language as q35
+    from mlx_vlm.models.qwen3_5.gated_delta import gated_delta_update
+    from omlx.patches import qwen35_gdn_verify_fused as fused_mod
+
+    assert fused_mod.apply_arrays_cache_replay_patch()
+    B, T, Hk, Hv, Dk, Dv = 1, 6, 16, 48, 128, 128
+    mx.random.seed(909)
+    norm = q35.Qwen3_5RMSNormGated(Dv, eps=1e-6)
+    norm.weight = (1.0 + 0.1 * mx.random.normal((Dv,))).astype(dtype)
+    layer = SimpleNamespace(
+        num_k_heads=Hk,
+        num_v_heads=Hv,
+        head_k_dim=Dk,
+        head_v_dim=Dv,
+        A_log=mx.log(mx.random.uniform(low=0.1, high=16.0, shape=(Hv,))).astype(mx.float32),
+        dt_bias=(mx.random.normal((Hv,)) * 0.5).astype(dtype),
+        norm=norm,
+    )
+    q = (mx.random.normal((B, T, Hk, Dk)) * 0.1).astype(dtype)
+    k = (mx.random.normal((B, T, Hk, Dk)) * 0.1).astype(dtype)
+    v = (mx.random.normal((B, T, Hv, Dv)) * 0.1).astype(dtype)
+    a = (mx.random.normal((B, T, Hv)) * 0.5).astype(dtype)
+    b = (mx.random.normal((B, T, Hv)) * 0.5).astype(dtype)
+    z = (mx.random.normal((B, T, Hv, Dv)) * 0.5).astype(dtype)
+    state = (mx.random.normal((B, Hv, Dv, Dk)) * 0.05).astype(mx.float32)
+
+    y_ref, state_ref = gated_delta_update(q, k, v, a, b, layer.A_log, layer.dt_bias, state=state, use_kernel=True)
+    out_ref = layer.norm(y_ref, z).reshape(B, T, Hv * Dv)
+
+    cache = ArraysCache(size=2)
+    cache[1] = state
+    tx = start_speculative_cache([cache], T)
+    try:
+        assert fused_mod.fused_eligible(layer, q, cache, T)
+        out_fused = fused_mod.verify_block(layer, cache, q, k, v, a, b, z)
+        state_fused = cache[1]
+        mx.eval(out_fused, state_fused, out_ref, state_ref)
+        if dtype == mx.bfloat16:
+            assert mx.array_equal(out_fused.view(mx.uint16), out_ref.view(mx.uint16)).item()
+            assert mx.array_equal(state_fused.view(mx.uint32), state_ref.view(mx.uint32)).item()
+        else:
+            assert mx.allclose(out_fused, out_ref, rtol=2e-3, atol=1e-6).item()
+            assert mx.allclose(state_fused, state_ref, rtol=2e-3, atol=1e-6).item()
+    finally:
+        tx.abort()

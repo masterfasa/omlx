@@ -151,3 +151,39 @@ def test_keep_array_caches_small_tuples():
     assert a is b
     assert a.dtype == mx.int32
     assert a.tolist() == [3]
+
+
+@pytest.mark.parametrize(
+    "q_dtype,a_log_dtype,want",
+    [
+        (mx.bfloat16, mx.float32, True),
+        (mx.bfloat16, mx.bfloat16, True),
+        (mx.bfloat16, mx.float16, False),
+        (mx.float16, mx.float32, True),
+        (mx.float16, mx.bfloat16, False),
+    ],
+)
+def test_replay_and_fused_eligibility_allows_fp32_a_log(q_dtype, a_log_dtype, want):
+    from types import SimpleNamespace
+
+    class Cache:
+        _speculation = {"length": 4, "records": {}}
+
+        def __getitem__(self, index):
+            return None
+
+    norm = Qwen3_5RMSNormGated(128)
+    norm.weight = mx.ones((128,), q_dtype)
+    layer = SimpleNamespace(
+        norm=norm,
+        head_k_dim=128,
+        head_v_dim=128,
+        num_v_heads=8,
+        num_k_heads=4,
+        A_log=mx.ones((8,), a_log_dtype),
+        dt_bias=mx.ones((8,), q_dtype),
+    )
+    assert patch.apply_arrays_cache_replay_patch()
+    q = mx.zeros((1, 4, 4, 128), q_dtype)
+    assert patch.replay_eligible(layer, q, Cache(), 4) is want
+    assert patch.fused_eligible(layer, q, Cache(), 4) is want
